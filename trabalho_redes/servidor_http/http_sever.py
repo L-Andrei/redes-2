@@ -1,105 +1,139 @@
+import sys
+import time
+import signal
 import socket
-import os
-import datetime
+import threading
 
-# Configurações do servidor
-HOST = '127.0.0.1'  # Endereço IP do servidor (localhost)
-PORT = 8080         # Porta onde o servidor escutará as conexões
+# Handler para capturar o sinal de interrupção (Ctrl+C)
+def signal_handler(sig, frame):
+    print("\n[DEBUG] Proxy encerrado pelo usuário.")
+    sys.exit(0)
 
-# Nome do arquivo padrão
-DEFAULT_FILE = "index.html"
+# Classe Proxy para criar um servidor proxy simples
+class Proxy:
+    def __init__(self):
+        # Criação do socket TCP
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permitir reuso da porta
+        
+        # Configuração do endereço e porta
+        self.ip = "127.0.0.1"
+        self.port = 8080
+        self.sock.bind((self.ip, self.port))
+        self.sock.listen(10)  # Permitir até 10 conexões simultâneas
+        
+        print(f"[DEBUG] Proxy iniciado em {self.ip}:{self.port}")
+        
+        # Iniciar a thread para gerenciar múltiplas requisições
+        start_multirequest = threading.Thread(target=self.multirequest)
+        start_multirequest.daemon = True  # Usando a forma moderna de definir a thread como daemon
+        start_multirequest.start()
+        
+        # Loop principal para manter o proxy ativo
+        while True:
+            time.sleep(0.01)
+            signal.signal(signal.SIGINT, signal_handler)
 
-# Cria um socket TCP
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind((HOST, PORT))
-server_socket.listen(5)  # Define o limite máximo de conexões pendentes
-print(f"Servidor HTTP rodando em http://{HOST}:{PORT}")
+    # Método para gerenciar múltiplas conexões simultâneas
+    def multirequest(self):
+        while True:
+            # Aceitar nova conexão de cliente
+            clientSocket, client_address = self.sock.accept()
+            print(f"[DEBUG] Nova conexão de {client_address[0]}:{client_address[1]}")
+            
+            # Criar uma nova thread para lidar com a conexão
+            client_process = threading.Thread(target=self.main, args=(clientSocket, client_address))
+            client_process.daemon = True
+            client_process.start()
 
-def get_http_date():
-    """Retorna a data atual no formato HTTP/1.1."""
-    now = datetime.datetime.utcnow()
-    return now.strftime('%a, %d %b %Y %H:%M:%S GMT')
-
-def load_file(file_path):
-    """Carrega o conteúdo do arquivo especificado."""
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        with open(file_path, 'rb') as file:
-            return file.read()
-    return None
-
-try:
-    while True:
-        # Aguarda uma conexão
-        client_socket, client_address = server_socket.accept()
-        print(f"Conexão recebida de {client_address}")
-
-        # Recebe os dados da requisição
-        request = client_socket.recv(1024).decode('utf-8')
-        print(f"Requisição recebida:\n{request}")
-
-        # Extrai o caminho solicitado na requisição
-        lines = request.splitlines()
-        if len(lines) > 0:
-            request_line = lines[0]
-            requested_path = request_line.split(' ')[1]
-
-            # Se a URL solicitada for "/", usa o arquivo padrão
-            if requested_path == '/':
-                requested_path = f"/{DEFAULT_FILE}"
-
-            # Remove o "/" inicial para formar o caminho correto
-            file_path = requested_path.lstrip('/')
-
-            # Carrega o arquivo solicitado
-            response_body = load_file(file_path)
-            if response_body is not None:
-                response_headers = (
-                    "HTTP/1.1 200 OK\r\n"
-                    f"Date: {get_http_date()}\r\n"
-                    "Server: SimplePythonHTTPServer/1.0\r\n"
-                    "Content-Type: text/html\r\n"
-                    f"Content-Length: {len(response_body)}\r\n"
-                    "Connection: close\r\n"
-                    "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-                    "Pragma: no-cache\r\n"
-                    "Expires: 0\r\n"
-                    "\r\n"
-                )
+    # Método principal que lida com a comunicação entre o cliente e o servidor
+    def main(self, client_conn, client_addr):
+        try:
+            # Recebe a solicitação do cliente
+            origin_request = client_conn.recv(4096)
+            try:
+                # Decodifica a solicitação usando UTF-8
+                request = origin_request.decode(encoding="utf-8")
+            except UnicodeDecodeError:
+                # Usa uma codificação alternativa caso UTF-8 falhe
+                request = origin_request.decode(encoding="latin1")
+            
+            print(f"[DEBUG] Requisição recebida de {client_addr[0]}: {request.splitlines()[0]}")
+            
+            # Analisa a URL da primeira linha da solicitação HTTP
+            first_line = request.split("\r\n")[0]
+            url = first_line.split(" ")[1]
+            
+            # Processa a URL para obter o servidor e porta
+            http_pos = url.find("://")
+            temp = url[(http_pos + 3):] if http_pos != -1 else url
+            port_pos = temp.find(":")
+            webserver_pos = temp.find("/")
+            webserver_pos = webserver_pos if webserver_pos != -1 else len(temp)
+            
+            if port_pos == -1 or webserver_pos < port_pos:
+                port = 80  # Porta padrão
+                webserver = temp[:webserver_pos]
             else:
-                # Responde com 404 se o arquivo não for encontrado
-                response_body = "<html><body><h1>404 Not Found</h1><p>Arquivo não encontrado.</p></body></html>".encode('utf-8')
-                response_headers = (
-                    "HTTP/1.1 404 Not Found\r\n"
-                    f"Date: {get_http_date()}\r\n"
-                    "Server: SimplePythonHTTPServer/1.0\r\n"
-                    "Content-Type: text/html; charset=utf-8\r\n"
-                    f"Content-Length: {len(response_body)}\r\n"
-                    "Connection: close\r\n"
-                    "\r\n"
-                )
+                port = int(temp[(port_pos + 1):])
+                webserver = temp[:port_pos]
+            
+            print(f"[DEBUG] Conectando a {webserver}:{port}")
+            
+            # Conecta ao servidor web
+            server_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_conn.settimeout(1000)
+            try:
+                server_conn.connect((webserver, port))
+                print(f"[DEBUG] Conexão estabelecida com {webserver}:{port}")
+            except Exception as e:
+                print(f"[DEBUG] Falha ao conectar a {webserver}:{port} - {e}")
+                client_conn.close()
+                server_conn.close()
+                return
+            
+            # Trata conexões HTTPS (porta 443)
+            if port == 443:
+                client_conn.send(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                client_conn.setblocking(0)
+                server_conn.setblocking(0)
+                while True:
+                    try:
+                        data = client_conn.recv(1024)
+                        if not data: break
+                        server_conn.send(data)
+                    except:
+                        pass
+                    try:
+                        data = server_conn.recv(1024)
+                        if not data: break
+                        client_conn.send(data)
+                    except:
+                        pass
+                server_conn.close()
+                client_conn.close()
+                print(f"[DEBUG] Conexão HTTPS com {client_addr[0]} encerrada.")
+                return
+            
+            # Envia a solicitação original para o servidor web
+            server_conn.sendall(origin_request)
+            print(f"[DEBUG] Requisição enviada para {webserver}:{port}")
+            
+            # Encaminha os dados do servidor para o cliente
+            while True:
+                data = server_conn.recv(4096)
+                if len(data) > 0:
+                    client_conn.send(data)
+                else:
+                    break
+            print(f"[DEBUG] Resposta de {webserver}:{port} enviada para {client_addr[0]}")
+            server_conn.close()
+            client_conn.close()
+            print(f"[DEBUG] Conexão com {client_addr[0]} encerrada.")
+        except Exception as e:
+            # Fecha conexões em caso de erro
+            print(f"[DEBUG] Erro na conexão com {client_addr[0]}: {e}")
+            client_conn.close()
 
-        else:
-            # Responde com 400 em caso de erro na requisição
-            response_body = "<html><body><h1>400 Bad Request</h1><p>Requisição inválida.</p></body></html>"
-            response_headers = (
-                "HTTP/1.1 400 Bad Request\r\n"
-                f"Date: {get_http_date()}\r\n"
-                "Server: SimplePythonHTTPServer/1.0\r\n"
-                "Content-Type: text/html\r\n"
-                f"Content-Length: {len(response_body)}\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-            )
-
-        # Envia os cabeçalhos e o corpo da resposta ao cliente
-        client_socket.sendall(response_headers.encode('utf-8') + response_body)
-
-        # Fecha a conexão com o cliente
-        client_socket.close()
-
-except KeyboardInterrupt:
-    print("\nServidor interrompido pelo usuário.")
-
-finally:
-    server_socket.close()
-    print("Servidor encerrado.")
+# Inicializa o servidor proxy
+Proxy()
