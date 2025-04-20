@@ -1,20 +1,18 @@
 import socket
 import threading
-import time
 
 # Configurações do servidor
 HOST = '127.0.0.1'
 PORT = 65433
 BUFFER_SIZE = 1024
-SOCKET_TIMEOUT = 30  # Tempo para considerar cliente inativo (em segundos)
+SOCKET_TIMEOUT = 30  # Tempo limite de inatividade em segundos
 
 # Lista de conexões ativas
 clients = {}  # socket -> nickname
-last_activity = {}  # socket -> timestamp da última atividade
-clients_lock = threading.Lock()
+clients_lock = threading.Lock()  # Lock para proteger o acesso concorrente à lista de clientes
 
 def broadcast(sender_socket, message):
-    """Envia mensagem para todos os clientes exceto o emissor"""
+    """Envia uma mensagem para todos os clientes, exceto o emissor."""
     with clients_lock:
         for socket_client, _ in clients.items():
             if socket_client != sender_socket:
@@ -23,54 +21,50 @@ def broadcast(sender_socket, message):
                 except:
                     socket_client.close()
 
+
 def get_socket_by_nickname(nickname):
-    """Retorna o socket associado a um nickname (caso exista)"""
+    """Retorna o socket associado a um nickname, ou None se não encontrado."""
     with clients_lock:
         for sock, nick in clients.items():
             if nick == nickname:
                 return sock
     return None
 
-def remove_client(client_socket):
-    """Remove cliente das estruturas e notifica os outros"""
-    with clients_lock:
-        if client_socket in clients:
-            nickname = clients[client_socket]
-            broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
-            del clients[client_socket]
-            if client_socket in last_activity:
-                del last_activity[client_socket]
-        client_socket.close()
-
 def handle_client_connection(client_socket, client_address):
-    """Gerencia a conexão com um cliente específico"""
+    """Gerencia a conexão e comunicação com um cliente específico."""
+    # Define um tempo limite de inatividade para desconexões silenciosas
     client_socket.settimeout(SOCKET_TIMEOUT)
 
+    # Adiciona o cliente com um nome padrão
     with clients_lock:
         clients[client_socket] = f"user_{client_address[0]}_{client_address[1]}"
-        last_activity[client_socket] = time.time()
 
     nickname = clients[client_socket]
 
+    # Envia mensagem de boas-vindas e instruções
     welcome = (
         f"Bem-vindo ao chat! Você está conectado como {nickname}\n"
         "Comandos disponíveis:\n"
         "/nick <nome> - Alterar seu nome\n"
         "/whisper <usuário> <mensagem> - Enviar mensagem privada\n"
         "/quit - Sair do chat\n"
+        "/ping - Manter conexão ativa\n"
     )
     client_socket.send(welcome.encode('utf-8'))
+
+    # Notifica os outros usuários sobre a entrada
     broadcast(client_socket, f">>> {nickname} entrou no chat <<<\n".encode('utf-8'))
 
     while True:
         try:
+            # Tenta receber dados do cliente
             data = client_socket.recv(BUFFER_SIZE)
             if not data:
                 break
 
-            last_activity[client_socket] = time.time()
             message = data.decode('utf-8').strip()
 
+            # Comando para alterar o nickname
             if message.startswith('/nick '):
                 with clients_lock:
                     new_nickname = message[6:].strip()
@@ -79,6 +73,7 @@ def handle_client_connection(client_socket, client_address):
                 client_socket.send(f"Seu nome foi alterado para {new_nickname}\n".encode('utf-8'))
                 broadcast(client_socket, f">>> {old_nickname} agora é conhecido como {new_nickname} <<<\n".encode('utf-8'))
 
+            # Comando para enviar mensagem privada
             elif message.startswith('/whisper '):
                 parts = message.split(' ', 2)
                 if len(parts) < 3:
@@ -99,14 +94,20 @@ def handle_client_connection(client_socket, client_address):
                 else:
                     client_socket.send(f"Usuário '{target_nick}' não encontrado.\n".encode('utf-8'))
 
+            # Comando para sair
             elif message == '/quit':
-                remove_client(client_socket)
+                with clients_lock:
+                    nickname = clients[client_socket]
+                    broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
+                    del clients[client_socket]
+                client_socket.close()
                 break
 
+            # Comando para manter conexão ativa
             elif message == '/ping':
-                # Cliente enviando sinal de atividade
-                client_socket.send(b"/pong\n")
+                client_socket.send("pong\n".encode('utf-8'))
 
+            # Mensagem normal para todos os usuários
             else:
                 with clients_lock:
                     nickname = clients[client_socket]
@@ -114,14 +115,27 @@ def handle_client_connection(client_socket, client_address):
                 broadcast(client_socket, broadcast_msg.encode('utf-8'))
 
         except socket.timeout:
-            client_socket.send("[AVISO] Você foi desconectado por inatividade.\n".encode('utf-8'))
-            remove_client(client_socket)
+            # Cliente inativo foi desconectado
+            with clients_lock:
+                if client_socket in clients:
+                    nickname = clients[client_socket]
+                    broadcast(client_socket, f">>> {nickname} foi desconectado por inatividade <<<\n".encode('utf-8'))
+                    del clients[client_socket]
+            client_socket.close()
             break
+
         except:
-            remove_client(client_socket)
+            # Desconexão abrupta ou erro na conexão
+            with clients_lock:
+                if client_socket in clients:
+                    nickname = clients[client_socket]
+                    broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
+                    del clients[client_socket]
+            client_socket.close()
             break
 
 def main():
+    """Função principal para iniciar o servidor."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PORT))
@@ -130,21 +144,25 @@ def main():
 
     try:
         while True:
+            # Aceita nova conexão de cliente
             client_socket, addr = server_socket.accept()
             print(f"Nova conexão de {addr}")
+
+            # Cria e inicia uma thread dedicada para o novo cliente
             client_thread = threading.Thread(
                 target=handle_client_connection,
                 args=(client_socket, addr)
             )
             client_thread.daemon = True
             client_thread.start()
+
     except KeyboardInterrupt:
         print("\nServidor encerrado")
     finally:
+        # Encerra todas as conexões ativas e o socket do servidor
         with clients_lock:
-            for client in list(clients.keys()):
+            for client in clients:
                 try:
-                    client.send("[SERVIDOR] Encerrando conexões.\n".encode('utf-8'))
                     client.close()
                 except:
                     pass
