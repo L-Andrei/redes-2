@@ -1,15 +1,17 @@
 import socket
 import threading
+import time
 
 # Configurações do servidor
 HOST = '127.0.0.1'
 PORT = 65433
 BUFFER_SIZE = 1024
+SOCKET_TIMEOUT = 30  # Tempo para considerar cliente inativo (em segundos)
 
 # Lista de conexões ativas
 clients = {}  # socket -> nickname
+last_activity = {}  # socket -> timestamp da última atividade
 clients_lock = threading.Lock()
-
 
 def broadcast(sender_socket, message):
     """Envia mensagem para todos os clientes exceto o emissor"""
@@ -21,7 +23,6 @@ def broadcast(sender_socket, message):
                 except:
                     socket_client.close()
 
-
 def get_socket_by_nickname(nickname):
     """Retorna o socket associado a um nickname (caso exista)"""
     with clients_lock:
@@ -30,11 +31,24 @@ def get_socket_by_nickname(nickname):
                 return sock
     return None
 
+def remove_client(client_socket):
+    """Remove cliente das estruturas e notifica os outros"""
+    with clients_lock:
+        if client_socket in clients:
+            nickname = clients[client_socket]
+            broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
+            del clients[client_socket]
+            if client_socket in last_activity:
+                del last_activity[client_socket]
+        client_socket.close()
 
 def handle_client_connection(client_socket, client_address):
     """Gerencia a conexão com um cliente específico"""
+    client_socket.settimeout(SOCKET_TIMEOUT)
+
     with clients_lock:
         clients[client_socket] = f"user_{client_address[0]}_{client_address[1]}"
+        last_activity[client_socket] = time.time()
 
     nickname = clients[client_socket]
 
@@ -54,6 +68,7 @@ def handle_client_connection(client_socket, client_address):
             if not data:
                 break
 
+            last_activity[client_socket] = time.time()
             message = data.decode('utf-8').strip()
 
             if message.startswith('/nick '):
@@ -85,12 +100,12 @@ def handle_client_connection(client_socket, client_address):
                     client_socket.send(f"Usuário '{target_nick}' não encontrado.\n".encode('utf-8'))
 
             elif message == '/quit':
-                with clients_lock:
-                    nickname = clients[client_socket]
-                    broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
-                    del clients[client_socket]
-                client_socket.close()
+                remove_client(client_socket)
                 break
+
+            elif message == '/ping':
+                # Cliente enviando sinal de atividade
+                client_socket.send(b"/pong\n")
 
             else:
                 with clients_lock:
@@ -98,15 +113,13 @@ def handle_client_connection(client_socket, client_address):
                 broadcast_msg = f"{nickname}: {message}\n"
                 broadcast(client_socket, broadcast_msg.encode('utf-8'))
 
-        except:
-            with clients_lock:
-                if client_socket in clients:
-                    nickname = clients[client_socket]
-                    broadcast(client_socket, f">>> {nickname} saiu do chat <<<\n".encode('utf-8'))
-                    del clients[client_socket]
-            client_socket.close()
+        except socket.timeout:
+            client_socket.send("[AVISO] Você foi desconectado por inatividade.\n".encode('utf-8'))
+            remove_client(client_socket)
             break
-
+        except:
+            remove_client(client_socket)
+            break
 
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -129,13 +142,13 @@ def main():
         print("\nServidor encerrado")
     finally:
         with clients_lock:
-            for client in clients:
+            for client in list(clients.keys()):
                 try:
+                    client.send("[SERVIDOR] Encerrando conexões.\n".encode('utf-8'))
                     client.close()
                 except:
                     pass
         server_socket.close()
-
 
 if __name__ == "__main__":
     main()
