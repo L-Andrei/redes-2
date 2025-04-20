@@ -5,7 +5,7 @@ import threading
 HOST = '127.0.0.1'
 PORT = 65433
 BUFFER_SIZE = 1024
-SOCKET_TIMEOUT = 30  # Tempo limite de inatividade em segundos
+SOCKET_TIMEOUT = 240  # Tempo limite de inatividade em segundos
 
 # Lista de conexões ativas
 clients = {}  # socket -> nickname
